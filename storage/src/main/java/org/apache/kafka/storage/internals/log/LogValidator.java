@@ -245,6 +245,9 @@ public class LogValidator {
             // case since we don't do key/value copies in this path (we just slice the ByteBuffer)
             int recordIndex = 0;
             for (Record record : batch) {
+                if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2)
+                    validateOffsetDelta(topicPartition, batch, record, recordIndex, metricsRecorder);
+
                 Optional<ApiRecordError> recordError = validateRecord(batch, topicPartition, record,
                     recordIndex, now, timestampType, timestampBeforeMaxMs, timestampAfterMaxMs, compactedTopic, metricsRecorder);
                 recordError.ifPresent(recordErrors::add);
@@ -343,6 +346,11 @@ public class LogValidator {
                 int recordIndex = 0;
                 while (recordsIterator.hasNext()) {
                     Record record = recordsIterator.next();
+                    // Skip when inPlaceAssignment is false: buildRecordsAndAssignOffsets below rebuilds every
+                    // offset from a counter regardless, so the original delta is never trusted.
+                    if (inPlaceAssignment && batch.magic() >= RecordBatch.MAGIC_VALUE_V2)
+                        validateOffsetDelta(topicPartition, batch, record, recordIndex, metricsRecorder);
+
                     long expectedOffset = expectedInnerOffset.value++;
 
                     Optional<ApiRecordError> recordError = validateRecordCompression(sourceCompressionType,
@@ -509,6 +517,27 @@ public class LogValidator {
 
         if (batch.hasProducerId() && toMagic < RecordBatch.MAGIC_VALUE_V2)
             throw new UnsupportedForMessageFormatException("Idempotent records cannot be used with magic version " + toMagic);
+    }
+
+    /**
+     * Producers write offset deltas 0..count-1 in order. Combined with the count == lastOffsetDelta + 1 check in
+     * {@link #validateBatch}, this guarantees offsets strictly increase within the batch and stay inside
+     * [baseOffset, lastOffset], which readers of the log (such as the log cleaner via MemoryRecordsBuilder) rely on.
+     * The batch header alone cannot guarantee this: a record with an out-of-order or negative offsetDelta can still
+     * produce a self-consistent header.
+     */
+    static void validateOffsetDelta(TopicPartition topicPartition,
+                                    RecordBatch batch,
+                                    Record record,
+                                    int recordIndex,
+                                    MetricsRecorder metricsRecorder) {
+        // Offsets are not assigned yet, so baseOffset is still the client-supplied value.
+        long offsetDelta = record.offset() - batch.baseOffset();
+        if (offsetDelta != recordIndex) {
+            metricsRecorder.recordInvalidOffset();
+            throw new InvalidRecordException("Record " + recordIndex + " has offset delta " + offsetDelta
+                + " but expected " + recordIndex + " in topic partition " + topicPartition);
+        }
     }
 
     private static Optional<ApiRecordError> validateRecord(RecordBatch batch,
